@@ -691,6 +691,50 @@ def add_monthly_summaries(calendar: Calendar, custom_activity_names: dict = None
     )
     return calendar
 
+def prune_deleted_events(
+    calendar: Calendar,
+    live_uids: Set[str],
+    window_start: date,
+    window_end: date,
+    kinds: Set[str],
+) -> Calendar:
+    """
+    Remove activity events inside the fetched date window whose Oura object is
+    no longer present (it was deleted in the app) or no longer qualifies (e.g.
+    a workout now below MIN_DURATION_MINUTES).
+
+    Only events of the given kinds (the collections that were actually
+    fetched) whose day falls within [window_start, window_end] are considered.
+    Events outside the window are left untouched because the fetch carries no
+    information about them, foreign events without X-OURA-KIND are never
+    touched, and monthly summaries are regenerated separately.
+    """
+    kept = []
+    removed = 0
+    for component in calendar.subcomponents:
+        kind = _event_kind(component)
+        if kind is None or kind not in kinds:
+            kept.append(component)
+            continue
+
+        day = _event_day(component)
+        if day is None or not (window_start <= day <= window_end):
+            kept.append(component)
+            continue
+
+        uid = str(component.get('uid', ''))
+        if uid in live_uids:
+            kept.append(component)
+            continue
+
+        summary = str(component.get('summary', ''))
+        print(f"Pruning event deleted in Oura: {uid} ('{summary}')")
+        removed += 1
+
+    calendar.subcomponents = kept
+    print(f"Pruned {removed} deleted event(s) in window {window_start} to {window_end}.")
+    return calendar
+
 def save_calendar(calendar: Calendar, path: str) -> bool:
     """Write the calendar to disk. Returns True on success, False on I/O error."""
     try:
