@@ -1,8 +1,15 @@
 from datetime import datetime, date, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
+from collections import Counter
+from calendar import monthrange
 from icalendar import Calendar, Event
 import os
 import re
+
+# UID prefix of the auto-generated monthly summary events. These are derived
+# from the real activity events, so they are excluded from the per-month
+# totals and recomputed on every run.
+MONTHLY_SUMMARY_UID_PREFIX = "oura-activity-summary-"
 
 # Kinds of Oura objects turned into events, stored in X-OURA-KIND so later runs
 # can recognise (and summarise or prune) their own events straight from the
@@ -521,6 +528,168 @@ def generate_activity_calendar(
             _build_daily_activity_event, daily_activity_uid,
         )
     return cal, live_uids
+
+def _is_monthly_summary(component) -> bool:
+    """True if a calendar component is an auto-generated monthly summary event."""
+    if component.name != "VEVENT":
+        return False
+    if component.get('x-oura-monthly-summary') is not None:
+        return True
+    uid = component.get('uid')
+    return uid is not None and str(uid).startswith(MONTHLY_SUMMARY_UID_PREFIX)
+
+def _event_kind(component) -> Optional[str]:
+    """The X-OURA-KIND of one of our activity events, or None for anything else."""
+    if component.name != "VEVENT" or _is_monthly_summary(component):
+        return None
+    kind = component.get('x-oura-kind')
+    return str(kind) if kind is not None else None
+
+def _event_day(component) -> Optional[date]:
+    """
+    The day an event belongs to: Oura's own `day` (stored in X-OURA-DAY) when
+    available, otherwise the date the event starts on. Returns None if the
+    event has no usable date.
+    """
+    stored = component.get('x-oura-day')
+    if stored is not None:
+        try:
+            return date.fromisoformat(str(stored))
+        except ValueError:
+            pass
+    dtstart = component.get('dtstart')
+    value = getattr(dtstart, 'dt', None)
+    # datetime is a subclass of date, so check it first to get the day portion.
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return None
+
+def _int_prop(component, key) -> Optional[int]:
+    value = component.get(key)
+    if value is None:
+        return None
+    try:
+        return int(float(str(value)))
+    except ValueError:
+        return None
+
+def _build_monthly_summary_event(year: int, month: int, totals: Dict) -> Event:
+    """Create an all-day summary event on the last day of (year, month)."""
+    last_day = date(year, month, monthrange(year, month)[1])
+    workouts: Counter = totals["workouts"]
+    sessions: Counter = totals["sessions"]
+    steps: List[int] = totals["steps"]
+
+    def by_count(counter: Counter) -> List[str]:
+        # Most frequent first; ties broken alphabetically for stable output.
+        return [
+            f"{count}x {label}"
+            for label, count in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
+
+    lines = [f"Workouts: {sum(workouts.values())}"]
+    lines.extend(by_count(workouts))
+    if workouts:
+        lines.append(f"Total Workout Time: {convert_to_hh_mm(totals['workout_seconds'])}")
+    if totals["distance"]:
+        lines.append(f"Total Distance: {totals['distance'] / 1000:.1f} km")
+    if totals["calories"]:
+        lines.append(f"Total Calories: {_format_int(totals['calories'])} kcal")
+    if steps:
+        lines.append(
+            f"Avg Daily Steps: {_format_int(sum(steps) / len(steps))} "
+            f"({len(steps)} day{'s' if len(steps) != 1 else ''})"
+        )
+    if sessions:
+        lines.append(f"Sessions: {sum(sessions.values())}")
+        lines.extend(by_count(sessions))
+
+    event = Event()
+    event.add('uid', f"{MONTHLY_SUMMARY_UID_PREFIX}{year:04d}-{month:02d}")
+    event.add('dtstart', last_day)  # date value -> all-day event
+    event.add('dtend', last_day + timedelta(days=1))
+    now_utc = datetime.now(timezone.utc)
+    event.add('dtstamp', now_utc)
+    event.add('created', now_utc)
+    event.add('last-modified', now_utc)
+    event.add('transp', 'TRANSPARENT')  # informational; don't mark as busy
+    event.add('x-oura-monthly-summary', '1')
+    event.add('summary', f"📊 Activity Summary, {last_day.strftime('%B %Y')}")
+    event.add('description', "\n".join(lines))
+    return event
+
+def add_monthly_summaries(calendar: Calendar, custom_activity_names: dict = None, enabled: bool = True) -> Calendar:
+    """
+    Insert/refresh an all-day summary event on the last day of each month that
+    contains activity events, with workout counts per activity type, total
+    workout time, distance and calories, average daily steps and sessions.
+
+    The summaries are computed from the X-OURA-* metrics of all activity events
+    in the calendar, so months outside the fetch window keep accurate totals.
+    Previously generated summaries are always dropped (so none linger after the
+    feature is disabled) and re-added when enabled. A summary whose content is
+    unchanged is preserved so calendar clients don't see spurious updates.
+    """
+    months: Dict[Tuple[int, int], Dict] = {}
+    for component in calendar.walk('VEVENT'):
+        kind = _event_kind(component)
+        if kind is None:
+            continue
+        day = _event_day(component)
+        if day is None:
+            continue
+        totals = months.setdefault((day.year, day.month), {
+            "workouts": Counter(), "workout_seconds": 0, "distance": 0,
+            "calories": 0, "steps": [], "sessions": Counter(),
+        })
+        if kind == KIND_WORKOUT:
+            # Label from the raw activity type with the current config, so
+            # renaming an activity also renames it in past summaries.
+            activity = component.get('x-oura-activity')
+            totals["workouts"][format_activity_label(activity, custom_activity_names)] += 1
+            totals["workout_seconds"] += _int_prop(component, 'x-oura-duration') or 0
+            totals["distance"] += _int_prop(component, 'x-oura-distance') or 0
+            totals["calories"] += _int_prop(component, 'x-oura-calories') or 0
+        elif kind == KIND_SESSION:
+            session_type = component.get('x-oura-type')
+            totals["sessions"][format_session_label(session_type, custom_activity_names)] += 1
+        elif kind == KIND_DAILY_ACTIVITY:
+            steps = _int_prop(component, 'x-oura-steps')
+            if steps is not None:
+                totals["steps"].append(steps)
+
+    existing_summaries = {
+        str(c.get('uid')): c for c in calendar.walk('VEVENT') if _is_monthly_summary(c)
+    }
+    calendar.subcomponents = [c for c in calendar.subcomponents if not _is_monthly_summary(c)]
+    if not enabled:
+        if existing_summaries:
+            print(f"Monthly summaries disabled; removed {len(existing_summaries)} existing summary event(s).")
+        return calendar
+
+    created = 0
+    preserved = 0
+    for (year, month), totals in sorted(months.items()):
+        event = _build_monthly_summary_event(year, month, totals)
+        prev = existing_summaries.get(str(event.get('uid')))
+        if prev is not None and _same_content(prev, event):
+            calendar.add_component(prev)
+            preserved += 1
+            continue
+        # Preserve the original CREATED time when refreshing a month's summary.
+        if prev is not None and prev.get('created') is not None:
+            event.pop('created', None)
+            event.add('created', prev.get('created').dt)
+        calendar.add_component(event)
+        created += 1
+
+    print(
+        f"Monthly summaries: {len(months)} month(s) "
+        f"({created} created/updated, {preserved} unchanged)."
+    )
+    return calendar
 
 def save_calendar(calendar: Calendar, path: str) -> bool:
     """Write the calendar to disk. Returns True on success, False on I/O error."""
