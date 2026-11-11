@@ -8,6 +8,8 @@ import re
 # can recognise (and summarise or prune) their own events straight from the
 # calendar file, which is the only persistence layer.
 KIND_WORKOUT = "workout"
+KIND_SESSION = "session"
+KIND_DAILY_ACTIVITY = "daily_activity"
 
 # Fallback icon for workout activity types without a known mapping
 FALLBACK_ACTIVITY_ICON = "🏅"
@@ -77,6 +79,22 @@ ACTIVITY_LABELS = {
     "other": (FALLBACK_ACTIVITY_ICON, "Other"),
 }
 
+# Map Oura session ("Moment") types to icon and name
+SESSION_LABELS = {
+    "breathing": ("🌬️", "Breathing"),
+    "meditation": ("🧘", "Meditation"),
+    "nap": ("😴", "Nap"),
+    "relaxation": ("🛀", "Relaxation"),
+    "rest": ("🛋️", "Rest"),
+    "body_status": ("🩺", "Body Status"),
+}
+
+# Fallback icon for session types without a known mapping
+FALLBACK_SESSION_ICON = "🧘"
+
+# Icon of the all-day daily activity events
+DAILY_ACTIVITY_ICON = "👟"
+
 # Human-readable workout sources
 SOURCE_LABELS = {
     "manual": "Manual",
@@ -123,6 +141,19 @@ def format_activity_label(activity, custom_activity_names: dict = None) -> str:
         icon, name = ACTIVITY_LABELS[key]
         return f"{icon} {name}"
     return f"{FALLBACK_ACTIVITY_ICON} {_humanize(key) or 'Workout'}"
+
+def format_session_label(session_type, custom_activity_names: dict = None) -> str:
+    """Convert a session type to an icon + name label (custom names win)."""
+    raw = str(session_type or "")
+    key = normalize_activity(raw)
+    if custom_activity_names:
+        for candidate in (raw, key):
+            if candidate in custom_activity_names:
+                return custom_activity_names[candidate]
+    if key in SESSION_LABELS:
+        icon, name = SESSION_LABELS[key]
+        return f"{icon} {name}"
+    return f"{FALLBACK_SESSION_ICON} {_humanize(key) or 'Session'}"
 
 def _empty_calendar() -> Calendar:
     cal = Calendar()
@@ -249,6 +280,108 @@ def _build_workout_event(workout: Dict, custom_activity_names: dict = None) -> E
         event.add('x-oura-source', str(source))
     return event
 
+def session_uid(session: Dict) -> str:
+    """Stable UID of a session event, derived from the Oura object id."""
+    return f"oura-session-{session.get('id')}"
+
+def _sample_average(sample) -> Optional[float]:
+    """Average of the non-null items of an Oura sample object, or None."""
+    if not isinstance(sample, dict):
+        return None
+    values = [v for v in (_number(i) for i in sample.get("items") or []) if v is not None]
+    return sum(values) / len(values) if values else None
+
+def _build_session_event(session: Dict, custom_activity_names: dict = None) -> Event:
+    """Build a timed event for a session. Raises ValueError on unusable data."""
+    if not session.get("id"):
+        raise ValueError("session without id")
+    start = _parse_datetime(session.get("start_datetime"))
+    end = _parse_datetime(session.get("end_datetime"))
+    if end < start:
+        raise ValueError("session ends before it starts")
+
+    duration_seconds = (end - start).total_seconds()
+    duration = convert_to_hh_mm(duration_seconds)
+    session_type = session.get("type") or "session"
+    label = format_session_label(session_type, custom_activity_names)
+    mood = session.get("mood")
+    avg_hr = _sample_average(session.get("heart_rate"))
+    avg_hrv = _sample_average(session.get("heart_rate_variability"))
+
+    lines = [
+        f"Type: {label}",
+        f"Duration: {duration}",
+    ]
+    if mood:
+        lines.append(f"Mood: {_humanize(str(mood))}")
+    if avg_hr is not None:
+        lines.append(f"Avg Heart Rate: {round(avg_hr)} bpm")
+    if avg_hrv is not None:
+        lines.append(f"Avg HRV: {round(avg_hrv)} ms")
+
+    event = _new_event(session_uid(session), KIND_SESSION, session.get("day"))
+    event.add('dtstart', start)
+    event.add('dtend', end)
+    event.add('summary', f"{label} {duration}")
+    event.add('description', "\n".join(lines))
+    event.add('x-oura-type', str(session_type))
+    event.add('x-oura-duration', str(int(round(duration_seconds))))
+    return event
+
+def daily_activity_uid(daily: Dict) -> str:
+    """Stable UID of a daily activity event, derived from the Oura object id."""
+    return f"oura-daily-activity-{daily.get('id')}"
+
+def _build_daily_activity_event(daily: Dict) -> Event:
+    """Build an all-day event for a day's activity. Raises ValueError on unusable data."""
+    if not daily.get("id"):
+        raise ValueError("daily activity without id")
+    day = date.fromisoformat(str(daily.get("day")))
+
+    score = _number(daily.get("score"))
+    steps = _number(daily.get("steps"))
+    active_calories = _number(daily.get("active_calories"))
+    total_calories = _number(daily.get("total_calories"))
+    walking_distance = _number(daily.get("equivalent_walking_distance"))
+
+    title_parts = []
+    if score is not None:
+        title_parts.append(f"Activity {int(score)}")
+    if steps is not None:
+        title_parts.append(f"{_format_int(steps)} steps")
+    title = f"{DAILY_ACTIVITY_ICON} {', '.join(title_parts) or 'Activity'}"
+
+    lines = []
+    if score is not None:
+        lines.append(f"Activity Score: {int(score)}")
+    if steps is not None:
+        lines.append(f"Steps: {_format_int(steps)}")
+    if active_calories is not None:
+        lines.append(f"Active Calories: {_format_int(active_calories)} kcal")
+    if total_calories is not None:
+        lines.append(f"Total Calories: {_format_int(total_calories)} kcal")
+    if walking_distance is not None:
+        lines.append(f"Walking Equivalent: {walking_distance / 1000:.1f} km")
+
+    event = _new_event(daily_activity_uid(daily), KIND_DAILY_ACTIVITY, day.isoformat())
+    event.add('dtstart', day)  # date value -> all-day event
+    event.add('dtend', day + timedelta(days=1))
+    event.add('summary', title)
+    if lines:
+        event.add('description', "\n".join(lines))
+    event.add('transp', 'TRANSPARENT')  # informational; don't mark as busy
+    if score is not None:
+        event.add('x-oura-score', str(int(score)))
+    if steps is not None:
+        event.add('x-oura-steps', str(int(steps)))
+    if active_calories is not None:
+        event.add('x-oura-active-calories', str(int(active_calories)))
+    if total_calories is not None:
+        event.add('x-oura-total-calories', str(int(total_calories)))
+    if walking_distance is not None:
+        event.add('x-oura-walking-distance', str(int(walking_distance)))
+    return event
+
 def _same_content(existing: Event, fresh: Event) -> bool:
     """True if two events have the same content (so an existing event need not
     be rewritten). Compares summary, description, the start/end values and the
@@ -307,14 +440,61 @@ def _index_events(cal: Calendar) -> Dict[str, Event]:
         if c.get('uid') is not None
     }
 
+PLURAL_NAMES = {"workout": "workouts", "session": "sessions"}
+
+def _merge_objects(
+    cal: Calendar,
+    existing_by_uid: Dict[str, Event],
+    live_uids: Set[str],
+    objects: List[Dict],
+    name: str,
+    build,
+    uid_of,
+    min_duration_minutes: float = 0,
+) -> None:
+    """Build an event for each fetched object and merge it into the calendar."""
+    stats = {"added": 0, "updated": 0, "unchanged": 0}
+    skipped_short = 0
+    skipped_invalid = 0
+    for obj in objects:
+        try:
+            event = build(obj)
+        except Exception as e:
+            print(f"Skipping {name} {obj.get('id')} due to invalid data: {e}")
+            skipped_invalid += 1
+            # Keep the existing event of an object whose update failed to
+            # parse rather than pruning it.
+            if obj.get("id"):
+                live_uids.add(uid_of(obj))
+            continue
+        duration = event.get('x-oura-duration')
+        if min_duration_minutes and duration is not None \
+                and int(str(duration)) / 60 < min_duration_minutes:
+            skipped_short += 1
+            continue
+        live_uids.add(str(event.get('uid')))
+        stats[_upsert_event(cal, existing_by_uid, event)] += 1
+
+    message = (
+        f"{PLURAL_NAMES.get(name, name).capitalize()}: added {stats['added']}, updated {stats['updated']}, "
+        f"skipped {stats['unchanged']} unchanged, "
+    )
+    if min_duration_minutes:
+        message += f"{skipped_short} shorter than {min_duration_minutes} min, "
+    print(message + f"{skipped_invalid} invalid.")
+
 def generate_activity_calendar(
     workouts: List[Dict],
     existing_calendar: Calendar,
     min_duration_minutes: float = 0,
     custom_activity_names: dict = None,
+    sessions: Optional[List[Dict]] = None,
+    daily_activity: Optional[List[Dict]] = None,
 ) -> Tuple[Calendar, Set[str]]:
     """
-    Merge fetched Oura workouts into the calendar.
+    Merge fetched Oura workouts, and optionally sessions and daily activity,
+    into the calendar. Pass None for a collection that was not fetched.
+    MIN_DURATION_MINUTES only applies to workouts.
 
     Returns (calendar, live_uids). live_uids holds the UID of every fetched
     object that still belongs in the calendar (including ones whose update
@@ -325,30 +505,21 @@ def generate_activity_calendar(
     existing_by_uid = _index_events(cal)
     live_uids: Set[str] = set()
 
-    stats = {"added": 0, "updated": 0, "unchanged": 0}
-    skipped_short = 0
-    skipped_invalid = 0
-    for workout in workouts:
-        try:
-            event = _build_workout_event(workout, custom_activity_names)
-        except Exception as e:
-            print(f"Skipping workout {workout.get('id')} due to invalid data: {e}")
-            skipped_invalid += 1
-            if workout.get("id"):
-                live_uids.add(workout_uid(workout))
-            continue
-        duration_minutes = int(str(event.get('x-oura-duration'))) / 60
-        if duration_minutes < min_duration_minutes:
-            skipped_short += 1
-            continue
-        live_uids.add(str(event.get('uid')))
-        stats[_upsert_event(cal, existing_by_uid, event)] += 1
-
-    print(
-        f"Workouts: added {stats['added']}, updated {stats['updated']}, "
-        f"skipped {stats['unchanged']} unchanged, {skipped_short} shorter than "
-        f"{min_duration_minutes} min, {skipped_invalid} invalid."
+    _merge_objects(
+        cal, existing_by_uid, live_uids, workouts, "workout",
+        lambda w: _build_workout_event(w, custom_activity_names), workout_uid,
+        min_duration_minutes=min_duration_minutes,
     )
+    if sessions is not None:
+        _merge_objects(
+            cal, existing_by_uid, live_uids, sessions, "session",
+            lambda s: _build_session_event(s, custom_activity_names), session_uid,
+        )
+    if daily_activity is not None:
+        _merge_objects(
+            cal, existing_by_uid, live_uids, daily_activity, "daily activity",
+            _build_daily_activity_event, daily_activity_uid,
+        )
     return cal, live_uids
 
 def save_calendar(calendar: Calendar, path: str) -> bool:
