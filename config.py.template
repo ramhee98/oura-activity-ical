@@ -1,0 +1,35 @@
+# Your Oura API access token (requires the 'workout' scope, plus 'session'
+# for INCLUDE_SESSIONS and 'daily' for INCLUDE_DAILY_ACTIVITY)
+OURA_TOKEN = "OURA_ACCESS_TOKEN"
+
+# Path where the generated iCalendar (.ics) file will be saved
+ICAL_OUTPUT_PATH = "./activity.ics"
+
+# Number of past days to fetch activity data for
+DAYS_BACK = 7
+
+# Minimum duration (in minutes) for a workout to be included in the calendar.
+# Workouts shorter than this threshold will be ignored.
+MIN_DURATION_MINUTES = 10
+
+# Add Oura sessions (meditation, breathing, relaxation, ...) as timed events.
+# Requires the 'session' scope.
+INCLUDE_SESSIONS = False
+
+# Add an all-day event per day with activity score, steps, active calories,
+# total calories and walking-equivalent distance. Requires the 'daily' scope.
+# The monthly summary takes its average daily steps from these events.
+INCLUDE_DAILY_ACTIVITY = True
+
+# Add an all-day "Activity Summary" event on the last day of each month with
+# workout counts per activity type, total workout time, distance, calories and
+# average daily steps. Recomputed on every run. Set to False to disable.
+MONTHLY_SUMMARY = True
+
+# Override the name and icon of activity types (workouts and sessions).
+# Keys are the activity types as returned by the Oura API, values are used
+# as-is, so include your own emoji/icon.
+# Run `python3 main.py --discover` to print a ready-to-paste block.
+CUSTOM_ACTIVITY_NAMES = {
+    # "strength_training": "💪 Gym",
+}
