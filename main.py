@@ -31,6 +31,7 @@ from ical.generator import (
     load_existing_calendar,
     add_monthly_summaries,
     prune_deleted_events,
+    describe_events,
     format_activity_label,
     format_session_label,
     normalize_activity,
@@ -89,6 +90,11 @@ def main():
         "--no-prune",
         action="store_true",
         help="Keep calendar events whose data was deleted in the Oura app (default: remove them)"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch and process data, print the resulting events, but do not write the calendar file"
     )
     args = parser.parse_args()
 
@@ -150,6 +156,12 @@ def main():
 
     print("Refreshing monthly activity summaries...")
     calendar = add_monthly_summaries(calendar, CUSTOM_ACTIVITY_NAMES, enabled=MONTHLY_SUMMARY)
+
+    if args.dry_run:
+        print(f"\nDry run: not writing {ICAL_OUTPUT_PATH}. Events from {window_start} to {window_end}:\n")
+        for line in describe_events(calendar, window_start, window_end):
+            print(f"  {line}")
+        return
 
     print(f"Saving calendar to {ICAL_OUTPUT_PATH}...")
     if not save_calendar(calendar, ICAL_OUTPUT_PATH):

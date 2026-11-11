@@ -735,6 +735,34 @@ def prune_deleted_events(
     print(f"Pruned {removed} deleted event(s) in window {window_start} to {window_end}.")
     return calendar
 
+def describe_events(calendar: Calendar, window_start: date, window_end: date) -> List[str]:
+    """
+    One line per activity event whose day is in [window_start, window_end],
+    plus the summaries of the months that window touches, sorted by start.
+    Used by --dry-run to show what the calendar would contain.
+    """
+    rows = []
+    for component in calendar.walk('VEVENT'):
+        if _event_kind(component) is None and not _is_monthly_summary(component):
+            continue
+        day = _event_day(component)
+        if day is None:
+            continue
+        if _is_monthly_summary(component):
+            in_window = (window_start.year, window_start.month) <= (day.year, day.month) \
+                <= (window_end.year, window_end.month)
+        else:
+            in_window = window_start <= day <= window_end
+        if not in_window:
+            continue
+        start = component.get('dtstart').dt
+        if isinstance(start, datetime):
+            when = start.astimezone().strftime('%Y-%m-%d %H:%M')
+        else:
+            when = f"{start.isoformat()} all-day"
+        rows.append((when, str(component.get('summary', ''))))
+    return [f"{when:<18}  {summary}" for when, summary in sorted(rows)]
+
 def save_calendar(calendar: Calendar, path: str) -> bool:
     """Write the calendar to disk. Returns True on success, False on I/O error."""
     try:
